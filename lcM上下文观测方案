@@ -1,0 +1,236 @@
+react step
+├─ context_assemble
+├─ chat LLM
+├─ execute_tool
+└─ afterturn
+
+context_compact 第一版统一挂在 Agent 下。
+
+核心原则
+
+不再用时间戳匹配 Step。时间戳只用于耗时分析。
+
+不修改现有 Step Span 创建逻辑。
+
+新增 LogicalStep 关联层：运行时确定归属，finalize 后映射真实 stepSpanId。
+
+agent_end 只负责 materialize，不负责重新猜归属。
+
+数据结构
+
+interface LcmLogicalStep {
+  ordinal: number;
+  callId?: string;
+  runId?: string;
+
+  assembleEvents: LcmTraceEvent[];
+  afterturnEvents: LcmTraceEvent[];
+  ingestEvents: LcmTraceEvent[];
+
+  stepSpanId?: string;
+}
+
+ctx.lcmLogicalSteps: LcmLogicalStep[];
+ctx.lcmPendingAssemble: LcmTraceEvent[];
+
+建议每个 LCM event 增加单调递增的 eventSeq，用于表示真实事件顺序。
+
+运行时绑定
+
+assemble
+
+assemble
+→ 暂存到 pendingAssemble
+
+不要立即创建 Span，也不要立即找 Step。
+
+model_call_started
+
+1. drain 上一轮 afterturn / ingest
+   → 绑定 previous LogicalStep
+
+2. 创建新的 LogicalStep
+   → ordinal++
+   → 保存 callId / runId
+
+3. drain pending assemble
+   → 绑定当前 LogicalStep
+
+示意：
+
+assemble #1
+→ model_call_started #1
+→ LogicalStep #1
+
+afterturn #1
+assemble #2
+→ model_call_started #2
+   ├─ afterturn #1 → LogicalStep #1
+   └─ assemble #2  → LogicalStep #2
+
+多次 assemble
+
+如果一次模型调用前：
+
+assemble A
+assemble B
+model_call_started
+
+不要创建两个 Step，全部绑定到同一个 LogicalStep。
+
+最终 UI 可以合并成：
+
+context_assemble
+assemble.count = 2
+
+AfterTurn
+
+不要依赖 after_tool_call。
+
+规则：
+
+下一次 model_call_started 时，把累计的 afterturn / ingest 绑定给上一个 LogicalStep。
+
+最后一轮没有下一次 model_call_started，所以在 agent_end 做最后一次 drain。
+
+Step Span 映射
+
+真实 Step Span 继续由现有 finalize 逻辑创建。
+
+创建完成后：
+
+LogicalStep #1 → StepSpan #1
+LogicalStep #2 → StepSpan #2
+
+第一版按内部调用顺序 ordinal 映射。
+
+注意：
+
+不使用 UI 上显示的 step 编号。
+
+stepSpanId 必须使用真实 OTel spanContext().spanId。
+
+不使用自己 generateId() 的假 spanId。
+
+LCM Span 创建时机
+
+推荐在 agent_end 统一 materialize：
+
+agent_end
+→ final drain afterturn / compact
+→ LogicalStep 已经有完整归属
+→ StepSpan 已经存在
+→ 创建 LCM child spans
+
+区别是：
+
+旧方案：
+agent_end → 根据时间戳猜归属
+
+新方案：
+运行时已经绑定 LogicalStep
+agent_end 只把 LogicalStep 映射成真实 StepSpan
+
+UI 顺序
+
+左侧调用树不要只按 startTime 排。
+
+增加业务排序：
+
+context_assemble = 10
+LLM              = 20
+TOOL             = 30
+afterturn         = 90
+
+同一 phase 内再按真实时间排序。
+
+这样左侧固定表达：
+
+context_assemble
+chat LLM
+execute_tool
+afterturn
+
+但真实 startTime/endTime 不修改，继续用于 Timeline 和耗时分析。
+
+Compact
+
+第一版：
+
+Agent
+└─ context_compact
+
+只有真正发生 compression 时才创建 context_compact。
+
+below threshold / shouldCompact=false 不创建。
+
+后续再按 trigger 细分：
+
+after_turn
+maintain
+background
+assemble_emergency
+manual
+
+异常兜底
+
+assemble 没有 model call
+
+挂 Agent，并标记：
+
+lcm.orphan = true
+lcm.reason = no_model_call_anchor
+
+afterturn 没有 LogicalStep
+
+挂 Agent，不要猜。
+
+LogicalStep 数量和 StepSpan 数量不一致
+
+能按 ordinal 对应的正常挂载；多余的挂 Agent，并标记：
+
+mapping_status = unmatched
+
+不要用时间戳强行补配。
+
+验收
+
+单 LLM
+
+Step
+├─ context_assemble
+├─ LLM
+└─ afterturn
+
+LLM → Tool → LLM
+
+Step A
+├─ context_assemble
+├─ LLM
+├─ Tool
+└─ afterturn
+
+Step B
+├─ context_assemble
+├─ LLM
+└─ afterturn
+
+多 Tool
+
+Step
+├─ context_assemble
+├─ LLM
+├─ Tool A
+├─ Tool B
+└─ afterturn
+
+Compact
+
+真正压缩时：
+
+Agent
+└─ context_compact
+
+一句话总结
+
+LCM Event 记录事实，LogicalStep 负责运行时确定归属，agent_end 只负责 materialize，timestamp 只做性能分析，左侧树用 phaseOrder 表达业务调用顺序。

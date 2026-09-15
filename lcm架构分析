@@ -1,0 +1,60 @@
+lossless-claw 是 OpenClaw 的无损上下文管理插件，用 DAG（有向无环图）摘要系统代替传统的截断式上下文窗口。目录布局：
+lossless-claw/
+├── src/                          # 核心实现
+│   ├── engine.ts                 # 插件主入口 / 装配 contextEngine
+│   ├── assembler.ts              # 上下文组装器
+│   ├── compaction.ts             # 压缩主流程
+│   ├── compaction-guards.ts      # 压缩守卫（防止误删）
+│   ├── compaction-telemetry.ts   # 压缩遥测
+│   ├── summarize.ts              # LCM 摘要生成
+│   ├── summary-fallback.ts       # 摘要降级
+│   ├── expansion.ts              # 摘要展开
+│   ├── expansion-policy.ts       # 展开策略
+│   ├── expansion-auth.ts         # 展开时的鉴权检测（避免假阳性）
+│   ├── retrieval.ts              # 摘要 DAG 的相关性检索
+│   ├── focus-briefs.ts           # 焦点简报（按任务挑选节点）
+│   ├── context-threshold.ts      # 触发压缩的阈值
+│   ├── estimate-tokens.ts        # token 估算
+│   ├── token-accounting.ts       # token 账本
+│   ├── bootstrap-budget.ts       # 启动预算控制
+│   ├── tool-pairing.ts           # 工具调用配对
+│   ├── tool-result-blocks.ts     # 工具结果外部化
+│   ├── read-tool-recovery.ts     # 读工具恢复
+│   ├── live-coverage.ts          # 实时覆盖率追踪
+│   ├── transcript.ts / -reconciler.ts / -repair.ts   # 会话转录维护
+│   ├── session-rotation.ts / session-rollover.ts     # 会话轮换
+│   ├── prune.ts                  # 修剪（注意 AGENTS.md 的无损原则）
+│   ├── large-files.ts / large-file-interceptor.ts    # 大文件处理
+│   ├── heartbeat-filter.ts       # 心跳消息过滤
+│   ├── batch-dedup.ts            # 批量去重
+│   ├── db/                       # SQLite 持久化层
+│   ├── store/                    # 存储抽象
+│   ├── plugin/                   # 插件 SDK 适配
+│   ├── tools/                    # 暴露给 LLM 的工具
+│   └── cli/                      # CLI 子命令
+├── docs/                         # 用户文档
+├── specs/                        # 设计规格
+├── architecture/                 # 架构说明
+├── skills/lossless-claw/         # 捆绑技能
+├── openclaw.plugin.json          # 插件清单（含 configSchema）
+├── package.json
+└── AGENTS.md / RELEASING.md / SECURITY.md
+
+用户消息
+   ↓
+[engine.ts] 收消息 → 写入 SQLite（按 session 分组，原始永留）
+   ↓
+[context-threshold.ts] 判断是否超过阈值（默认 0.75）
+   ↓
+[compaction.ts] 触发压缩
+   ├─ [compaction-guards.ts] 守卫检查（无损优先）
+   ├─ [summarize.ts] 通过 runtime.llm.complete 调用 summaryModel 生成摘要
+   │     └─ 失败则 [summary-fallback.ts] 降级
+   └─ 摘要节点写入 DAG（多层级，旧→新）
+   ↓
+[assembler.ts] 下次请求时组装上下文：
+   ├─ [retrieval.ts] 选最相关节点
+   ├─ [focus-briefs.ts] 按当前任务生成焦点简报
+   └─ 原始未压缩内容仍可按需 [expansion.ts] 展开
+
+

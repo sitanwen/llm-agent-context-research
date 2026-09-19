@@ -1,60 +1,740 @@
-lossless-claw 是 OpenClaw 的无损上下文管理插件，用 DAG（有向无环图）摘要系统代替传统的截断式上下文窗口。目录布局：
-lossless-claw/
-├── src/                          # 核心实现
-│   ├── engine.ts                 # 插件主入口 / 装配 contextEngine
-│   ├── assembler.ts              # 上下文组装器
-│   ├── compaction.ts             # 压缩主流程
-│   ├── compaction-guards.ts      # 压缩守卫（防止误删）
-│   ├── compaction-telemetry.ts   # 压缩遥测
-│   ├── summarize.ts              # LCM 摘要生成
-│   ├── summary-fallback.ts       # 摘要降级
-│   ├── expansion.ts              # 摘要展开
-│   ├── expansion-policy.ts       # 展开策略
-│   ├── expansion-auth.ts         # 展开时的鉴权检测（避免假阳性）
-│   ├── retrieval.ts              # 摘要 DAG 的相关性检索
-│   ├── focus-briefs.ts           # 焦点简报（按任务挑选节点）
-│   ├── context-threshold.ts      # 触发压缩的阈值
-│   ├── estimate-tokens.ts        # token 估算
-│   ├── token-accounting.ts       # token 账本
-│   ├── bootstrap-budget.ts       # 启动预算控制
-│   ├── tool-pairing.ts           # 工具调用配对
-│   ├── tool-result-blocks.ts     # 工具结果外部化
-│   ├── read-tool-recovery.ts     # 读工具恢复
-│   ├── live-coverage.ts          # 实时覆盖率追踪
-│   ├── transcript.ts / -reconciler.ts / -repair.ts   # 会话转录维护
-│   ├── session-rotation.ts / session-rollover.ts     # 会话轮换
-│   ├── prune.ts                  # 修剪（注意 AGENTS.md 的无损原则）
-│   ├── large-files.ts / large-file-interceptor.ts    # 大文件处理
-│   ├── heartbeat-filter.ts       # 心跳消息过滤
-│   ├── batch-dedup.ts            # 批量去重
-│   ├── db/                       # SQLite 持久化层
-│   ├── store/                    # 存储抽象
-│   ├── plugin/                   # 插件 SDK 适配
-│   ├── tools/                    # 暴露给 LLM 的工具
-│   └── cli/                      # CLI 子命令
-├── docs/                         # 用户文档
-├── specs/                        # 设计规格
-├── architecture/                 # 架构说明
-├── skills/lossless-claw/         # 捆绑技能
-├── openclaw.plugin.json          # 插件清单（含 configSchema）
-├── package.json
-└── AGENTS.md / RELEASING.md / SECURITY.md
+# Lossless Claw 技术原理与运行机制
 
-用户消息
-   ↓
-[engine.ts] 收消息 → 写入 SQLite（按 session 分组，原始永留）
-   ↓
-[context-threshold.ts] 判断是否超过阈值（默认 0.75）
-   ↓
-[compaction.ts] 触发压缩
-   ├─ [compaction-guards.ts] 守卫检查（无损优先）
-   ├─ [summarize.ts] 通过 runtime.llm.complete 调用 summaryModel 生成摘要
-   │     └─ 失败则 [summary-fallback.ts] 降级
-   └─ 摘要节点写入 DAG（多层级，旧→新）
-   ↓
-[assembler.ts] 下次请求时组装上下文：
-   ├─ [retrieval.ts] 选最相关节点
-   ├─ [focus-briefs.ts] 按当前任务生成焦点简报
-   └─ 原始未压缩内容仍可按需 [expansion.ts] 展开
+> 文档目标：让第一次接触 Lossless Claw 的研发、测试和运维人员，能够理解它解决什么问题、怎样工作、失败时如何降级，以及它不能解决什么。
+> 分析基线：Lossless Claw 官方 `upstream/main`，提交 `c168562`（准备 1.1.0 发布）；0.15.x 的差异单独说明。
+> 更新日期：2026-09-20
 
+## 1. Lossless Claw 是什么
 
+Lossless Claw，简称 LCM，是 OpenClaw 的第三方 Context Engine 插件。
+
+它解决的核心问题是：一个 Agent 的会话持续增长后，模型窗口装不下全部历史，但系统仍希望保留早期信息，并在需要时找回原始细节。
+
+普通压缩通常采用：
+
+```text
+旧消息 → 一份摘要 → 丢弃旧消息的模型可见副本
+```
+
+LCM 采用：
+
+```text
+原始消息持久化到 SQLite
+        ↓
+旧消息生成第一层摘要
+        ↓
+多份摘要继续合并成更高层摘要 DAG
+        ↓
+每轮给模型发送“摘要 + 最近原始消息”
+        ↓
+需要细节时，使用检索和展开工具回到原始材料
+```
+
+因此，“Lossless”不是说模型每轮仍能看到全部原文，而是说：
+
+- 模型当前看到的是压缩后的视图；
+- 原始消息仍保存在 LCM 数据库中；
+- 摘要与来源消息之间保留引用关系；
+- Agent 可以通过检索和展开工具重新获取细节。
+
+一句话概括：
+
+> **LCM 是一个“持久化历史 + 分层摘要 + 预算内组装 + 按需找回”的上下文管理系统。**
+
+## 2. 它在 OpenClaw 中处于什么位置
+
+一次模型调用并不是只包含聊天历史：
+
+```text
+最终模型请求
+= OpenClaw system prompt
++ tool schemas
++ LCM assembly
++ 当前轮用户消息
++ 当前轮尚未提交给 LCM 的 tool call / tool result
++ OpenClaw 运行时包装
++ 模型输出预留
+```
+
+LCM 主要控制中间的历史消息视图，即 `assembly`。OpenClaw 仍然负责：
+
+- 选择模型和 provider；
+- 构建 system prompt；
+- 注册和描述工具；
+- 维护当前 turn 的 tool loop；
+- 构造最终 provider 请求；
+- 执行网络调用和错误恢复；
+- 管理宿主 session/transcript。
+
+所以 LCM 的预算不天然等于最终模型请求预算。这是理解 LCM 事故的第一原则：
+
+```text
+LCM assembly 在预算内
+不等于
+OpenClaw 最终模型请求一定在预算内
+```
+
+新版本 OpenClaw 已在加强 Context Engine 的权威消息、当前轮 fencing、幂等 commit 和最终 prompt 契约，但部署时仍应验证所用 OpenClaw 与 LCM 版本组合。
+
+## 3. 核心架构
+
+### 3.1 总体数据流
+
+```text
+                ┌──────────────────────────────┐
+                │ OpenClaw session / transcript│
+                └──────────────┬───────────────┘
+                               │ bootstrap / ingest
+                               ▼
+┌─────────────────────────────────────────────────────────┐
+│                    Lossless Claw                         │
+│                                                         │
+│  conversations ── messages ── message_parts             │
+│          │              │                                │
+│          │              ├── large_files                  │
+│          │              │                                │
+│          ▼              ▼                                │
+│      context_items（当前有序视图）                       │
+│          │                                              │
+│          ├── raw messages                               │
+│          └── summary nodes                              │
+│                    │                                    │
+│                    ▼                                    │
+│              summary DAG                               │
+│       leaf summary → condensed summary                 │
+│                                                         │
+│  assembler：摘要 + 可淘汰历史 + fresh tail             │
+│  recall：grep → describe → expand_query                 │
+└──────────────────────────┬──────────────────────────────┘
+                           │ assembled messages
+                           ▼
+                 OpenClaw final prompt
+                           │
+                           ▼
+                         Model
+```
+
+### 3.2 主要模块
+
+| 模块 | 作用 |
+|---|---|
+| Context Engine bridge | 对接 OpenClaw 的 bootstrap、ingest、assemble、compact、afterTurn、maintain 和子 Agent 生命周期 |
+| SQLite stores | 保存 conversation、message、message parts、summary、context item、large file 和维护状态 |
+| Compaction engine | 将旧消息生成 leaf summary，并将摘要继续合并 |
+| Assembler | 按预算选择摘要、旧消息和 fresh tail，形成下一次模型输入历史 |
+| Large-file interceptor | 将超大附件、工具结果和部分原始载荷外置 |
+| Recall tools | 搜索、查看摘要/文件、展开摘要 DAG |
+| Compaction guards | 控制鉴权失败熔断、摘要调用频率和退避 |
+| Reconciliation | 将宿主可见 transcript 与 LCM 持久状态对齐 |
+| Subagent grants | 限制展开子 Agent 能访问的 conversation、token 和生命周期 |
+
+## 4. 数据模型
+
+### 4.1 Conversation
+
+OpenClaw 的一个运行 session 会映射到 LCM conversation。conversation 是消息、摘要和大文件的作用域。
+
+当前 1.x 还区分：
+
+- 物理 conversation ID；
+- 稳定 session identity；
+- `/new`、`/reset` 和 session family；
+- 父子 Agent 或 delegated session 的访问范围。
+
+作用域设计非常重要：范围太窄会导致“自己刚创建的文件却读不到”，范围太宽又可能让子 Agent 读到无关会话数据。
+
+### 4.2 Message 与 message_parts
+
+每条消息保存：
+
+- 顺序号；
+- role；
+- 文本内容；
+- token 估算；
+- 创建时间；
+- transcript entry id、response id 或 tool call id 等稳定身份。
+
+`message_parts` 还保存结构化内容块，例如 text、tool call、tool result、reasoning、file content 和 provider 特定结构。这样 assembly 时可以恢复结构化消息，而不是只能返回一段扁平文本。
+
+### 4.3 Context items
+
+`context_items` 是模型历史视图的有序索引。每一项指向一条原始 message 或一个 summary。
+
+压缩完成后，若一段旧 message 被 leaf summary 覆盖，LCM 会用这个 summary 替换相应的 context items，但不会删除原始 message。
+
+### 4.4 Summary DAG
+
+LCM 的摘要不是一条不断覆盖的总摘要，而是 DAG：
+
+```text
+原始消息 A、B、C ──→ leaf summary S1
+原始消息 D、E、F ──→ leaf summary S2
+原始消息 G、H、I ──→ leaf summary S3
+
+S1 + S2 + S3 ──→ condensed summary C1
+
+C1 + 其他同层摘要 ──→ 更高层 summary
+```
+
+Leaf summary：
+
+- depth 为 0；
+- 来源是连续的原始消息；
+- 保存 source message 关系；
+- 通常比输入小很多，但仍保留较具体的信息。
+
+Condensed summary：
+
+- depth 为 1 或更高；
+- 来源是同层的多个 summary；
+- 越高层越抽象；
+- 保存 parent summary 关系。
+
+每个 summary 还记录时间范围、token、后代数量、文件引用和来源关系。
+
+## 5. 一轮请求中 LCM 如何工作
+
+### 5.1 Bootstrap：第一次接管现有会话
+
+当 LCM 第一次看到 session 时，OpenClaw 向它提供当前可见 transcript projection。
+
+LCM 会：
+
+1. 找到或创建 conversation；
+2. 按稳定 transcript identity 去重；
+3. 导入尚未入库的可见消息；
+4. 对 fork/子会话使用 `bootstrapMaxTokens` 限制父历史导入量；
+5. 标记 bootstrap 状态。
+
+LCM 1.x 不应该自行解析和重写 OpenClaw 活动 SQLite transcript；宿主负责 transcript 可见性和 session target，LCM 只保存自身需要的数据。
+
+### 5.2 Ingest：保存消息
+
+OpenClaw 将消息交给 `ingest()`、`ingestBatch()` 或 accepted-turn commit 路径后，LCM：
+
+1. 过滤不应持久化的运行时包装；
+2. 根据 transcript id、stable event key 和内容身份去重；
+3. 检查大文件和大工具结果；
+4. 保存 message 和 message parts；
+5. 写入 context items；
+6. 更新 token 和维护状态。
+
+新宿主支持 durable turn contract 时，LCM 使用 current-turn fence 和幂等 advancement key，避免失败重试把同一 turn 写入两次。
+
+### 5.3 Assemble：模型调用前组装历史
+
+每次模型调用前，LCM 从 `context_items` 生成 assembly：
+
+```text
+[旧摘要/旧消息，可淘汰]
++
+[最近原始消息，fresh tail]
+```
+
+主要步骤：
+
+1. 按 ordinal 读取 context items；
+2. 将 summary 包装成带 ID、时间范围、depth、parent 的 XML；
+3. 重建结构化原始消息；
+4. 划分 evictable prefix 与 fresh tail；
+5. fresh tail 优先保留；
+6. 用剩余预算选择旧摘要/旧消息；
+7. 修复 tool use 与 tool result 配对；
+8. 返回 messages、estimatedTokens、promptAuthority 和 projection 信息。
+
+默认情况下，预算不足时淘汰更旧的 prefix。开启 `promptAwareEviction` 后，LCM 可以按当前 prompt 的相关性挑选旧内容，再恢复时间顺序；代价是 prompt prefix 不稳定，可能降低 provider cache 命中率。
+
+### 5.4 AfterTurn 与 Maintain：轮次结束后的维护
+
+`afterTurn()` 发生在模型本轮完成之后，用于落库消息、更新 token、判断阈值，并直接压缩或登记 deferred maintenance debt。
+
+当前默认 `proactiveThresholdCompactionMode` 为 `deferred`：
+
+```text
+本轮完成
+→ 达到阈值
+→ 记录一条合并后的 threshold debt
+→ 后台 maintain 或后续安全时机处理
+```
+
+这样可以减少正常回复等待摘要模型的时间。但如果会话增长很快，下一轮 assemble 时可能仍存在未清理的压缩债务。
+
+### 5.5 Compact：压缩请求
+
+压缩可能来自 afterTurn 达到阈值、`/compact`、OpenClaw 检测到 prompt overflow、maintenance 消费 deferred debt，以及 repair/doctor 操作。
+
+## 6. 摘要压缩怎样执行
+
+### 6.1 Leaf pass
+
+LCM 从 fresh tail 之前选择最老的一段连续原始消息：
+
+1. 不跨越受保护的最新区域；
+2. 不拆散 tool call / tool result 组合；
+3. 输入量受 `leafChunkTokens` 限制，当前默认 20K tokens；
+4. 带上最近前置摘要作为 `previous_context`，减少重复；
+5. 通过 OpenClaw 的 `runtime.llm.complete` 调用摘要模型；
+6. 保存 leaf summary，并用它替换相应 context items。
+
+### 6.2 Condensation pass
+
+当同一 depth 的摘要积累到一定数量后，LCM 将它们合并到更高层：
+
+```text
+多个 depth 0 leaf summaries → depth 1 condensed summary
+多个 depth 1 summaries → depth 2 condensed summary
+```
+
+正常 sweep 会尊重 `sweepMaxDepth`；如果摘要 prefix 仍然过大，pressure phase 可以使用更低 fanout 并继续向更深层压缩。
+
+### 6.3 Fresh tail 为什么不能随意压
+
+Fresh tail 保存最近的原始交互，因为最新内容通常包含当前用户的真实要求、尚未稳定的结果、tool call/result、用户刚做的纠偏，以及尚未被摘要可靠覆盖的信息。
+
+常规压缩会保护最新 user turn。强制 overflow recovery 可以继续压缩当前 turn 中更旧、且配对完整的 assistant/tool groups，但仍保留发起该轮的 user 消息和最近完整后缀。
+
+因此以下情况仍可能无法恢复：
+
+- 最新单条用户输入本身过大；
+- 最新工具结果过大且未外置；
+- 当前 tool group 不完整或配对不确定；
+- 受保护后缀本身超过 provider budget。
+
+## 7. Token 预算与最终请求
+
+LCM 接收 OpenClaw 传入的 `tokenBudget`，还可以用 `maxAssemblyTokenBudget` 设置更低硬上限。
+
+LCM 的 assembly 预算主要覆盖它返回的消息历史，不一定覆盖 OpenClaw 随后加入的全部 system prompt、工具 schema 和当前运行时开销。
+
+例如：
+
+```text
+模型窗口：200K
+OpenClaw 可用 prompt 预算：183K
+LCM assembly：118K
+system/tools/当前轮等其他内容：106K
+最终请求：224K
+```
+
+此时不能因为 `118K < LCM budget` 就说整条请求已经恢复。正确观测至少要区分：
+
+```text
+raw transcript tokens
+LCM stored-context tokens
+LCM assembly tokens
+fresh-tail tokens
+system-prompt tokens
+tool-schema tokens
+pending current-turn tokens
+final provider-bound prompt tokens
+```
+
+LCM 0.15.6 时代暴露过 assembly 与旧 OpenClaw preassembly 检查口径不一致的问题。新 OpenClaw 强化了 canonical assembly 和 promptAuthority 契约，但升级仍不能替代部署回归测试。
+
+## 8. 失败处理和降级策略
+
+LCM 不是遇到一次失败就直接停止，而是有多层恢复策略。
+
+### 8.1 摘要质量三级升级
+
+每个摘要节点通常按以下顺序尝试：
+
+1. **Normal summary**：正常提示词和目标长度；
+2. **Aggressive summary**：要求只保留耐久事实，目标更短；
+3. **Deterministic fallback**：不再依赖模型，截取并清洗内容，限制到约 `fallbackMaxTokens`，加入 fallback marker。
+
+触发升级的情况包括模型返回空内容、摘要比输入还大、摘要超过允许 overage，以及 provider 调用失败且没有其他可用候选。
+
+Fallback summary 能保证 token 有所下降，但语义质量明显低于模型摘要。LCM 的 doctor/TUI 会识别带 fallback 或 truncated marker 的摘要，便于后续 repair。
+
+### 8.2 Provider fallback
+
+摘要模型会按照显式 summary model、OpenClaw 默认 compaction model、当前运行时提示和 `fallbackProviders` 等候选解析。LCM 不自己管理 API key、OAuth、base URL 和 provider 传输；这些由 OpenClaw runtime LLM 层负责。
+
+### 8.3 鉴权熔断器
+
+连续鉴权失败达到 `circuitBreakerThreshold` 后，LCM 打开 circuit breaker，在 cooldown 内暂停相同 provider 的摘要调用。
+
+这能避免每轮重复请求已知无效凭据，但熔断期间压缩不会继续推进，系统可能进入 degraded mode。
+
+### 8.4 摘要调用 spend guard
+
+LCM 按 session/时间窗口限制摘要调用次数。超过 `summaryMaxCallsPerWindow` 后进入退避，防止坏会话或低压缩率模型不停烧 token。
+
+### 8.5 Sweep 次数和时间上限
+
+一个 full sweep 受 `maxSweepIterations` 和 `sweepDeadlineMs` 限制；`compactUntilUnder` 还有整个操作的 `compactUntilUnderDeadlineMs`。
+
+达到限制后返回当前一致的 partial result，而不是让 Agent turn 无限等待。Partial result 表示“已做了一部分有效压缩”，不等于“已经降到目标预算”。调用方必须继续检查 `finalTokens <= targetTokens`。
+
+### 8.6 Deferred maintenance debt
+
+达到阈值但采用 deferred 模式时，LCM 写入一条合并后的 threshold debt：
+
+- 后台 `maintain()` 有机会时消费；
+- 正常 assemble 且仍在预算内时可以继续等待；
+- live prompt 已超预算时，assemble 才同步执行紧急 drain；
+- 老版本遗留 debt 会重新验证，不再需要时标成 no-op 完成。
+
+### 8.7 Degraded-live fallback
+
+当正常持久化 assembly 暂时不能安全使用，例如维护债务仍挂起且预算压力很高，LCM 可以从 OpenClaw 提供的 live messages 构建尾窗：
+
+```text
+当前 live messages
+→ 从后向前选择能放入预算的消息
+→ 保持 tool call/result 配对
+→ 返回 degraded assembly
+```
+
+该路径的目标是“尽量让模型还能继续”，而不是保证完整历史语义。
+
+旧实现中的风险包括：它主要依赖 live tail、可能没有使用已有 summary；`promptAuthority: preassembly_may_overflow` 会要求宿主继续考虑更大的 preassembly 风险；插件局部预算成功不代表最终 prompt 成功；权威输入不变时可能重复同样的 overflow。
+
+当前 1.1.0 基线已经加入 first-turn 和 tool-heavy overflow recovery、serialized budget clamp 等改进，但受保护的最新消息仍可能真实超限。
+
+### 8.8 Host capability fallback
+
+LCM 需要 OpenClaw 原生运行时提供完整 Context Engine 生命周期。默认 `hostFallbackMode = "error"`，宿主缺少必要能力时 fail closed，避免表面启用、实际没有掌管 prompt。
+
+设置 `hostFallbackMode = "capture-only"` 后，通用 CLI harness 可以保存 transcript 并使用 recall tools，但不会获得 LCM prompt assembly，也不会由宿主触发 LCM compaction；后端自己的压缩仍归后端管理。
+
+## 9. 大载荷处理不是历史摘要
+
+LCM 有两套不同机制：
+
+| 机制 | 处理对象 | 发生时机 | 结果 |
+|---|---|---|---|
+| Summary compaction | 多轮历史消息 | 阈值、手动 compact、overflow | 生成 summary DAG |
+| Large payload externalization | 单条巨大文件/工具结果 | ingest 或受控 live preflight | 全文落盘，消息中放 file reference 和探索摘要 |
+
+如果单条工具结果已经有几十万 token，等待历史 compaction 往往太晚，因此需要先外置。
+
+## 10. 大文件与大工具结果如何外置
+
+### 10.1 触发对象
+
+当前实现可以处理用户消息中的 `<file>` 文本块、textual tool results、部分超大 raw payload、内联图片/base64 内容，以及已迁移到 `messages.large_content` 的历史工具结果 stub。
+
+文本阈值由 `largeFileThresholdTokens` 控制，当前默认 25K tokens。
+
+### 10.2 外置步骤
+
+```text
+发现单条内容超过阈值
+→ 生成 file_xxxxxxxxxxxxxxxx
+→ 全文写入 largeFilesDir/<conversation>/<fileId>.<ext>
+→ 在 large_files 表保存元数据
+→ 生成 exploration summary
+→ 原消息替换为 file id + 大小 + 摘要 + 检索提示
+```
+
+默认目录位于当前 `OPENCLAW_STATE_DIR` 下的 `lcm-files`。
+
+持久化 ingest 会拦截过大的工具结果；要让尚未进入 afterTurn 的当前轮 live tool result 也在模型调用前替换为 stub，需要关注 `stubLargeToolPayloads` 及相应数据迁移要求。该配置默认关闭，不能假设所有当前轮工具输出都会自动外置。
+
+### 10.3 Exploration summary 如何生成
+
+LCM 不会对所有文件一律调用 LLM：
+
+- JSON、CSV/TSV、YAML、XML 使用结构性探索；
+- 代码使用确定性代码概览；
+- 普通长文本在配置 summarizer 时取头部、中部和尾部样本，调用 LLM 生成约 200–300 词摘要；
+- 模型不可用时返回字符数、词数、行数、标题，以及开头和结尾各约 500 字符。
+
+探索摘要只是导航信息，不保证覆盖文件中间的全部关键细节。
+
+### 10.4 如何找回全文
+
+Agent 可以使用：
+
+- `lcm_grep(scope="files")`：搜索外置文件受限前缀；
+- `lcm_describe(file_xxx)`：读取文件内容和元数据；
+- 范围、分页或宿主读取能力继续定位。
+
+当前文档说明 `lcm_grep` 对每个文件最多扫描前 512,000 bytes，因此关键内容如果在更后面，单次 grep 不保证找到。
+
+### 10.5 当前设计的局限
+
+- 默认引用首先暴露 `file_xxx`，不一定给主 Agent 一个可直接调用 `read` 的原始路径；
+- `lcm_describe` 自身有 `expandFileMaxBytes` 上限；
+- 检索受到 conversation scope 和 delegated grant 限制；
+- 模型必须正确选择 `lcm_grep` 或 `lcm_describe`；
+- exploration summary 可能漏掉精确错误、配置值或中间段落；
+- 如果外置发生在当前 fresh tail，错误的工具选择会直接影响当前任务。
+
+## 11. 指令型文档读取的语义风险
+
+`SKILL.md`、`AGENTS.md`、`AGENTS.override.md`、`CLAUDE.md` 与普通日志不同。它们不仅是资料，还是模型后续行为所依赖的指令源。
+
+但在官方 1.1.0 基线中，大载荷拦截器主要根据消息角色、工具名称、内容大小和结构工作，并不知道某个 `read` 结果具有“必须连续读取并执行”的指令语义。
+
+### 11.1 一个完整示例
+
+假设 Agent 调用：
+
+```text
+read("C:/project/skills/deploy/SKILL.md")
+```
+
+文件较大时可能发生：
+
+```text
+第一层：OpenClaw read 工具先限制输出
+返回：前 25,760 bytes + "output truncated ..."
+
+第二层：LCM 识别到 read 输出带截断标记
+根据 tool call input 找回原始绝对路径
+在文件不超过 8 MiB 时重新读取全文
+
+第三层：重读后的全文超过 LCM 25K-token 阈值
+LCM 把它当成普通大型 tool result 外置
+返回：file_xxx + exploration summary + lcm_describe 提示
+```
+
+于是表面现象是：
+
+```text
+Agent 明明读的是 SKILL.md
+→ 却只拿到一个大文件摘要或 file id
+→ 后续没有继续读取完整指令
+→ skill 执行不完整或行为跑偏
+```
+
+这里不是 LCM 识别到“这是一个 skill”后决定截断；恰恰相反，是因为当前通用管线**没有识别它是指令文件**，才把它当成普通大文本处理。
+
+### 11.2 为什么最初这样设计
+
+这条链路的出发点是合理的：OpenClaw 截断后的 read 结果可能丢失关键内容；LCM 尝试从原始路径恢复全文；全文又可能撑爆上下文；因而外置并提供检索入口。
+
+问题在于它只解决了容量，没有保留“指令来源地址和必须继续读取”的语义。
+
+### 11.3 更合适的处理方式
+
+对已知指令文件应采用：
+
+```text
+保留原始绝对路径
+→ 不把 source identity 替换成匿名 file_xxx
+→ 返回明确的 continuation hint
+→ 要求继续使用 read(path, offset, limit)
+→ 分段读完后再执行
+```
+
+建议返回形式：
+
+```text
+[LCM Instruction File]
+Source path: "C:/project/skills/deploy/SKILL.md"
+The file exceeded the inline budget.
+Continue reading the same path with bounded offset/limit ranges.
+Do not use lcm_describe for this instruction source.
+```
+
+这正是已提交的 [Lossless Claw PR #1190](https://github.com/Martian-Engineering/lossless-claw/pull/1190) 所做的改进。本文分析基线的官方 `upstream/main` 尚未包含该提交，因此它应标记为待合入修复，不能当成当前官方能力。
+
+## 12. Recall 工具怎样工作
+
+LCM 推荐的召回顺序是：
+
+```text
+lcm_grep → lcm_describe → lcm_expand_query
+```
+
+### 12.1 lcm_grep
+
+用于快速搜索 messages、summaries 或外置 files 的受限扫描范围，支持 regex 和 FTS5 full-text。它返回 snippet 和命中 ID，不会把全部历史直接放回上下文。
+
+### 12.2 lcm_describe
+
+用于查看一个确定对象：`sum_xxx` 返回摘要及关系元数据；`file_xxx` 返回文件元数据、探索摘要和受限内容。这是数据库直接查询，通常比子 Agent 展开便宜。
+
+### 12.3 lcm_expand_query
+
+当摘要不足以回答精确问题时，它会选择摘要、创建受限 delegation grant、启动临时子 Agent、沿 DAG 下钻来源消息/文件、返回带引用的精炼答案，并清理 grant/session。
+
+它不是零成本查询：默认可能运行几十秒到约两分钟，并受 timeout 和 token cap 限制。
+
+## 13. Conversation scope 与子 Agent
+
+默认 recall 工具访问当前 session family，而不是全局全部 conversation，以避免越权、跨客户混用和无界检索。
+
+但作用域实现错误会出现：
+
+```text
+delegated session 创建 file_xxx
+→ 当前 delegated conversation 却不在授权 scope
+→ lcm_describe 返回无权访问或找不到
+```
+
+[PR #1189](https://github.com/Martian-Engineering/lossless-claw/pull/1189) 针对的就是 delegated session 应能访问其自身 conversation 的问题。
+
+## 14. `allowConversationAccess` 的作用
+
+推荐配置：
+
+```json
+{
+  "plugins": {
+    "slots": { "contextEngine": "lossless-claw" },
+    "entries": {
+      "lossless-claw": {
+        "enabled": true,
+        "hooks": { "allowConversationAccess": true },
+        "config": {}
+      }
+    }
+  }
+}
+```
+
+这个权限位于 `hooks`，与 `config` 平级。
+
+没有它时：
+
+- LCM Context Engine 仍可能正常加载；
+- ingest、assembly、compact 和数据库不会因此全部停止；
+- OpenClaw 会阻止 LCM 的 `before_prompt_build` recall-policy hook；
+- 模型收不到“优先使用 lcm_grep/describe/expand、摘要属于不可信历史、冲突时验证”等静态说明。
+
+因此它主要影响召回工具的使用质量和摘要安全提示，不是自动压缩失败的直接原因。
+
+## 15. LCM 能力范围
+
+### 15.1 能解决
+
+- 长会话旧历史压缩；
+- 原始消息持久化；
+- 多层摘要 DAG；
+- 按预算组装历史；
+- 压缩后细节搜索和展开；
+- 跨 session family 的连续召回；
+- 大附件和工具载荷外置；
+- 摘要 provider fallback、熔断和 repair；
+- transcript bootstrap、去重和对账；
+- 有界的子 Agent 深度召回。
+
+### 15.2 不能单独保证
+
+- OpenClaw 最终 prompt 一定不超模型窗口；
+- system prompt 和 tool schemas 一定足够小；
+- 最新单条巨大消息一定能压缩；
+- 当前未完成 tool group 可以安全裁剪；
+- summarizer 永远可用；
+- 摘要不会遗漏关键细节；
+- 模型一定主动使用 recall 工具；
+- 所有 MCP/自研工具结果都能自动得到正确语义处理；
+- 不兼容的 OpenClaw/LCM 版本组合仍能正常工作。
+
+## 16. 为什么会出现 `Auto-compaction could not recover`
+
+这条错误不是说 LCM 一定完全没压缩，而是 OpenClaw 尝试恢复后，最终模型请求仍不满足预算或恢复契约。
+
+常见原因：
+
+1. LCM assembly 变小，但最终请求还包含很大的 system/tools/current turn；
+2. fresh tail 或最新工具结果本身超限；
+3. summarizer 超时、鉴权失败、限流或熔断；
+4. compact 达到时间/轮数上限，只返回 partial result；
+5. 没有更多符合安全条件的压缩候选；
+6. 宿主版本没有正确采用 canonical assembly；
+7. 当前 tool call/result 配对不完整；
+8. deferred debt 尚未完成，degraded-live 也无法形成合法最终请求。
+
+成功定义必须是：
+
+```text
+压缩产生实际进展
+并且
+下一次 provider-bound prompt 已在真实预算内
+```
+
+不能只依据 `compact()` 被调用，或 LCM 局部 estimatedTokens 低于自己的上限。
+
+## 17. 0.15.6 与 1.x 的重要差异
+
+0.15.x 主要面向旧 file-backed OpenClaw，会涉及 JSONL transcript、session rotation 和 backlog reconciliation。
+
+1.x 面向新的 Context Engine/SQLite 宿主契约：
+
+- OpenClaw 管理活动 transcript；
+- LCM 保存自己的 conversation、message、summary 和 recall 数据；
+- `transcriptGcEnabled`、`autoRotateSessionFiles` 仅作为兼容配置接受，值已被忽略；
+- durable turn fencing、幂等 commit、host capability 和 session target 更重要；
+- 运行时要求与旧版不同。
+
+排障时必须先确认版本，不能把 0.15.6 的 rotation 建议直接套到 1.x。
+
+## 18. 建议的生产观测指标
+
+每轮至少记录：
+
+```text
+sessionKey / runId / conversationId
+host tokenBudget / model context window
+storedContextTokens
+assemblyTokens
+freshTailTokens / freshTailMessageCount
+summaryPrefixTokens / summary depth
+promptAuthority
+compaction trigger / target / rounds
+tokensBefore / tokensAfter（必须同口径）
+summary provider / model / latency / outcome
+fallback marker / circuit-breaker state / spend-backoff state
+large-file count / externalized bytes / file scope
+host finalPromptTokens（如果宿主提供）
+```
+
+不能把 `hostObservedTokens - LCMStoredTokens` 直接命名为 `tokensSaved`。两者不是同一统计对象时，这个差值会制造“压缩成功很多”的假象。
+
+## 19. 推荐测试矩阵
+
+上线前至少覆盖：
+
+1. 长对话逐步越过 threshold；
+2. 单条 30K、100K、300K token 工具结果；
+3. 大日志关键错误位于中部和尾部；
+4. `SKILL.md`、`AGENTS.md` 分段读取；
+5. summarizer 鉴权失败、限流、超时和空响应；
+6. fallback summary 生成与 doctor repair；
+7. `/compact`、自动 threshold compact 和 provider overflow recovery；
+8. 当前轮包含多个完整/不完整 tool groups；
+9. 主 Agent、delegated session、forked subagent 的 file/summary scope；
+10. `/new`、`/reset` 和重新唤醒；
+11. LCM assembly 合法但 system/tool schemas 很大；
+12. 缺少 `allowConversationAccess`；
+13. capture-only 与不支持完整 lifecycle 的 CLI host；
+14. 升级前后 SQLite migration 和版本回滚。
+
+验收指标应以任务完成和最终请求为中心，而不是只看摘要数量：主流程完成率、overflow 自动恢复率、最终 prompt 超限次数、纠偏保留率、精确历史找回率、外置文件找回率、子 Agent scope 正确率，以及摘要延迟与费用。
+
+## 20. 当前设计的客观评价
+
+LCM 的价值在于：它比“一份摘要 + 最近消息”提供更强的长期、可追溯、可恢复记忆。
+
+它的复杂度也真实存在：OpenClaw 与 LCM 都有状态；本地预算与最终请求预算需要协同；摘要模型引入额外延迟和失败面；大文件外置需要处理路径、权限和检索；子 Agent 引入 conversation scope；宿主契约持续演进。
+
+因此选型应根据业务优先级：
+
+```text
+流程不中断、故障面最小优先
+→ OpenClaw legacy 更简单
+
+长期记忆、可追溯和细节展开优先
+→ LCM 更有价值，但需要更严格的版本和回归治理
+```
+
+LCM 不是“永远不会丢信息的无限窗口”，也不是简单的聊天摘要插件。它是一个有持久化和召回能力、但需要与宿主严格协作的上下文子系统。
+
+## 21. 参考资料
+
+- [Lossless Claw README](https://github.com/Martian-Engineering/lossless-claw/blob/main/README.md)
+- [Lossless Claw Architecture](https://github.com/Martian-Engineering/lossless-claw/blob/main/docs/architecture.md)
+- [Lossless Claw Configuration](https://github.com/Martian-Engineering/lossless-claw/blob/main/docs/configuration.md)
+- [Lossless Claw Agent Tools](https://github.com/Martian-Engineering/lossless-claw/blob/main/docs/agent-tools.md)
+- [OpenClaw Context Engine](https://github.com/openclaw/openclaw/blob/main/docs/concepts/context-engine.md)
+- [OpenClaw Compaction](https://github.com/openclaw/openclaw/blob/main/docs/concepts/compaction.md)
+- [OpenClaw Hooks](https://github.com/openclaw/openclaw/blob/main/docs/plugins/hooks.md)
+- [PR #1176：暴露经过验证的大工具输出路径](https://github.com/Martian-Engineering/lossless-claw/pull/1176)
+- [PR #1189：delegated session 可访问自身 conversation](https://github.com/Martian-Engineering/lossless-claw/pull/1189)
+- [PR #1190：保留指令文件的原始读取路径](https://github.com/Martian-Engineering/lossless-claw/pull/1190)

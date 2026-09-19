@@ -81,38 +81,65 @@ OpenClaw 最终模型请求一定在预算内
 ### 3.1 总体数据流
 
 ```text
-                ┌──────────────────────────────┐
-                │ OpenClaw session / transcript│
-                └──────────────┬───────────────┘
-                               │ bootstrap / ingest
-                               ▼
-┌─────────────────────────────────────────────────────────┐
-│                    Lossless Claw                         │
-│                                                         │
-│  conversations ── messages ── message_parts             │
-│          │              │                                │
-│          │              ├── large_files                  │
-│          │              │                                │
-│          ▼              ▼                                │
-│      context_items（当前有序视图）                       │
-│          │                                              │
-│          ├── raw messages                               │
-│          └── summary nodes                              │
-│                    │                                    │
-│                    ▼                                    │
-│              summary DAG                               │
-│       leaf summary → condensed summary                 │
-│                                                         │
-│  assembler：摘要 + 可淘汰历史 + fresh tail             │
-│  recall：grep → describe → expand_query                 │
-└──────────────────────────┬──────────────────────────────┘
-                           │ assembled messages
-                           ▼
-                 OpenClaw final prompt
-                           │
-                           ▼
-                         Model
+会话开始
+   │
+   │ bootstrap：导入 OpenClaw 提供的可见 transcript projection
+   ▼
+┌────────────────────────────────────────────────────────────┐
+│                       Lossless Claw                         │
+│                                                            │
+│ conversations ─ messages / message_parts ─ large_files     │
+│       │                                                    │
+│       └──────── context_items（当前有序视图）               │
+│                       ├── raw messages                     │
+│                       └── summary DAG                      │
+│                           leaf → condensed                 │
+└─────────────────────────────┬──────────────────────────────┘
+                              │
+                模型调用前    │ assemble
+                              ▼
+                 摘要 + 预算内历史 + fresh tail
+                              │ assembled messages
+                              ▼
+                   OpenClaw 组装 final prompt
+                              │
+                              ▼
+                            Model
+                              │ response / tool loop 完成
+                              ▼
+                   OpenClaw 调用 afterTurn
+                              │
+                              ├── 对账可见 transcript projection
+                              ├── 去重本轮新增消息
+                              ├── ingestBatch：写入 messages/context_items
+                              └── 评估 contextThreshold
+                                      │
+                    ┌─────────────────┴──────────────────┐
+                    │                                    │
+              未达到阈值                          达到压缩阈值
+                    │                                    │
+                 本轮结束                  deferred：登记维护任务
+                                                 │       或
+                                                 │  inline：立即 sweep
+                                                 ▼
+                              maintain：宿主授权后执行一个有界维护 pass
+                                                 │
+                                                 ▼
+                                      更新 summary DAG/context_items
+
+手工 /compact 或 overflow recovery
+   └── compact / compactUntilUnder ──────────────► 更新同一套摘要与有序视图
 ```
+
+这里的 `afterTurn` 不是请求模型之前的压缩步骤，而是模型响应完成后的生命周期钩子。官方实现中，它负责：
+
+1. 找出 `prePromptMessageCount` 之后的新消息；
+2. 与 OpenClaw 可见 transcript 进行 reconciliation；
+3. 对新增消息去重后调用 `ingestBatch`；
+4. 写入成功后执行 post-turn threshold evaluation；
+5. 根据配置登记 deferred maintenance，或者在 inline 模式中执行完整 sweep。
+
+如果 `afterTurn` 的 ingest 失败，官方实现会跳过本轮 compaction，避免在消息前沿尚未完整持久化时压缩旧状态。deferred 模式下，真正的后台摘要工作由 OpenClaw 后续授权调用 `maintain()` 执行；手工压缩和溢出恢复则走 `compact()` / `compactUntilUnder()`。
 
 ### 3.2 主要模块
 

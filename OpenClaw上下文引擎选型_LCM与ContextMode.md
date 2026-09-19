@@ -3,11 +3,13 @@
 > 调研日期：2026-09-15
 > 调研目标：比较 LCM 与 Context Mode 谁更适合担任 OpenClaw 主 Context Engine，并确定超长工具输出的治理方案
 
+> 2026-09-20 补充：本报告当时以“长期可追溯记忆能力”为主要目标，因此推荐 LCM 作为主引擎。若客户第一优先级是“流程不能中断、故障面最小”，应优先使用 OpenClaw 原生 `legacy` 承担压缩。更完整的客观分析及 Codex / Claude Code 对比见：[Lossless Claw 的价值、复杂度与 Codex / Claude Code 上下文管理对比](./LosslessClaw价值与Codex-ClaudeCode上下文管理对比.md)。
+
 ## 1. 结论
 
 当前建议：
 
-1. **LCM 继续作为 OpenClaw 主 Context Engine。**它实际实现了原始消息持久化、分层摘要、预算内组装、压缩和历史展开，覆盖了 OpenClaw Context Engine 的主要职责。
+1. **主 Context Engine 应按目标选择。**若长期可追溯记忆优先，LCM 实现了原始消息持久化、分层摘要、预算内组装、压缩和历史展开；若客户把“流程不能中断、故障面最小”放在第一位，应优先使用 OpenClaw 原生 `legacy` 承担压缩。
 2. **Context Mode 用于工具执行优化和可检索记忆。**它擅长将大文件、日志和 API 数据放在上下文外处理，只返回筛选结果，从源头减慢上下文增长。
 3. **在 OpenClaw 工具结果边界新增 spill-policy。**对于未经过 Context Mode 的普通工具和第三方 MCP 结果，保存全文，仅把受限预览、引用和读取提示送入模型。
 4. **在 LCM 压缩阶段增加 tool-result pruner。**清理已经进入历史、没有被 spill 覆盖的超长工具结果。
@@ -252,10 +254,9 @@ retrievalHint
 ## 10. 最终建议
 
 ```text
-主 Context Engine：LCM
+稳定优先：OpenClaw legacy + 宿主级 spill + 工具输出限额
+长期记忆优先：经过固定版本验证的 LCM + 宿主级 spill
 工具事前优化：Context Mode 式 ctx_execute/ctx_execute_file
-普通工具兜底：OpenClaw 宿主级 spill-policy
-历史二次治理：LCM compaction-time tool-result pruner
 最终验收：OpenClaw provider-bound prompt token check
 ```
 
@@ -266,4 +267,4 @@ Context Mode 若要成为主 Context Engine 候选，需要先证明：
 3. overflow recovery 后的下一次请求确实变小；
 4. 用户纠偏、任务状态和父子 Agent 连续性达到或超过 LCM。
 
-在这些证据完成前，LCM 更适合承担主 Context Engine；Context Mode 和 DSH spill/pruner 的思路适合补强工具输出治理。
+在这些证据完成前，Context Mode 不适合单独承担主 Context Engine。LCM 是否承担主引擎，取决于客户是否愿意用更高的集成复杂度换取可追溯长期记忆；若流程连续性优先，则应选 OpenClaw `legacy`。Context Mode 和 DSH spill/pruner 的思路适合补强工具输出治理。
